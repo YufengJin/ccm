@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# 模拟 claude /login: 往配置目录写 oauthAccount 与凭证
+mkdir -p "$CLAUDE_CONFIG_DIR"
+cat > "$CLAUDE_CONFIG_DIR/.claude.json" <<JSON
+{"oauthAccount": {"accountUuid": "acct-LOGIN", "emailAddress": "login@x",
+                  "organizationType": "claude_max"}}
+JSON
+NOW=$(($(date +%s) * 1000 + 14400000))
+cat > "$CLAUDE_CONFIG_DIR/.credentials.json" <<JSON
+{"claudeAiOauth": {"accessToken": "sk-ant-oat01-LOGIN", "refreshToken": "sk-ant-ort01-LOGIN",
+                   "expiresAt": $NOW, "refreshTokenExpiresAt": $NOW}}
+JSON
+echo "FAKE_LOGIN done CFG=$CLAUDE_CONFIG_DIR"

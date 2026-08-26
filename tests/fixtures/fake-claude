@@ -1,0 +1,2 @@
+#!/usr/bin/env bash
+echo "FAKE_CLAUDE CFG=${CLAUDE_CONFIG_DIR:-unset} PIN=${CCM_PROFILE_PINNED:-0} ARGS=$*"

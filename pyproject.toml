@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ccm-claude"
+version = "0.1.0"
+description = "Claude Code 多账号统一管理 CLI:注册/切换/限流监控/配置共享/凭证刷新"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Yufeng Jin" }]
+keywords = ["claude", "claude-code", "account-manager", "cli"]
+classifiers = [
+  "Environment :: Console",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+]
+
+[project.urls]
+Repository = "https://github.com/YufengJin/ccm"
+
+[project.scripts]
+ccm = "ccm.cli:main"
+
+[tool.setuptools]
+packages = ["ccm"]
