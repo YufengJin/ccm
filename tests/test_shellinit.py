@@ -85,6 +85,32 @@ class TestShellInit(unittest.TestCase):
         self.assertIn(BLOCK_BEGIN, blk)
         self.assertIn(BLOCK_END, blk)
 
+    def test_rc_block_resolves_bin_before_path(self):
+        # Ubuntu ~/.profile 先 source .bashrc 再加 ~/.local/bin 进 PATH,
+        # 块内必须用绝对路径兜底,否则新登录 shell 的 eval 静默失败
+        blk = rc_block()
+        self.assertIn(".local/bin/ccm", blk)
+        self.assertIn("_CCM_BIN", blk)
+
+    def test_rc_block_survives_login_shell_path_order(self):
+        # 端到端复现:PATH 不含 ccm 时 source 块,env 仍应生效
+        import subprocess
+        rc_path = self.tmp / ".bashrc"
+        install_block(rc_path)
+        bindir = self.tmp / ".local" / "bin"
+        bindir.mkdir(parents=True)
+        # 假 ccm:env 子命令输出 export 语句
+        fake = bindir / "ccm"
+        fake.write_text("#!/bin/sh\n[ \"$1\" = env ] && echo 'export CLAUDE_CONFIG_DIR=/probe/dir'\n")
+        import os as _os
+        _os.chmod(fake, 0o755)
+        r = subprocess.run(
+            ["/bin/bash", "-c",
+             f"HOME={self.tmp} PATH=/usr/bin:/bin source {rc_path}; "
+             "echo GOT=$CLAUDE_CONFIG_DIR"],
+            capture_output=True, text=True)
+        self.assertIn("GOT=/probe/dir", r.stdout)
+
     def test_install_block_idempotent(self):
         rc_path = self.tmp / ".bashrc"
         rc_path.write_text("# 用户原有内容\ncca() { :; }\n")
