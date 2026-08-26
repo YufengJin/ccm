@@ -166,13 +166,21 @@ def cmd_usage(args):
         print(_t(["日期", "账号", "5h峰值", "7d峰值"],
                  [[d, e or "-", f"{a}%", f"{b}%"] for d, e, a, b in h]))
         return 0
+    def _active_uuid():
+        from ccm.usage import _fresh_identity
+        state = _env_ctx()[2]
+        name = (state or {}).get("active")
+        prof = registry.profiles.get(name) if name else None
+        return _fresh_identity(prof, env, registry.default_profile)[0] if prof else None
     if args.watch:
         import time as _time
+        from ccm.render import render_usage
         n = 0
+        au = _active_uuid()
         while True:
             rows = gather_usage(env, registry)
             print("\033[2J\033[H", end="")
-            _print_usage_table(rows)
+            print(render_usage(rows, active_uuid=au))
             n += 1
             if args.iterations and n >= args.iterations:
                 return 0
@@ -181,25 +189,9 @@ def cmd_usage(args):
     if args.json:
         print(_json.dumps(row_dicts(rows), ensure_ascii=False, indent=2))
         return 0
-    _print_usage_table(rows)
+    from ccm.render import render_usage
+    print(render_usage(rows, active_uuid=_active_uuid()))
     return 0
-
-
-def _print_usage_table(rows):
-    from ccm.render import table
-    ALERT = 80  # 阈值告警(spec P2)
-    body = []
-    for r in rows:
-        src = {"live": "实时", "cache": f"缓存({(r.cache_age_s or 0) // 3600}h前)",
-               "unavailable": "不可用"}[r.source]
-        def pct(v):
-            if v is None:
-                return "-"
-            return f"⚠{v}%" if v >= ALERT else f"{v}%"
-        body.append([r.email or r.account_uuid, "+".join(r.profiles),
-                     pct(r.five_hour_pct), r.five_hour_resets or "-",
-                     pct(r.seven_day_pct), r.seven_day_resets or "-", src])
-    print(table(["账号", "profiles", "5h", "重置", "7d", "重置", "来源"], body))
 
 
 def cmd_ls(args):
