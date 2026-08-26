@@ -34,6 +34,11 @@ ccm() {{
     *) "$__ccm_bin" "$@" ;;
   esac
 }}
+_ccm_completion() {{
+  local IFS=$'\n'
+  COMPREPLY=($("${{_CCM_BIN:-ccm}}" _complete "$COMP_CWORD" "${{COMP_WORDS[@]}}" 2>/dev/null))
+}}
+complete -o nosort -F _ccm_completion ccm 2>/dev/null || complete -F _ccm_completion ccm
 {BLOCK_END}"""
 
 

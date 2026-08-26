@@ -21,7 +21,7 @@ $ ccm usage
 bob@example.com    a3        4%   4h41m   35%   38h51m   实时
 alice@example.com  a1+a2     75%  11m     20%   137h01m  实时
 
-$ ccm use bob        # email 子串即可切换,当前终端立即生效
+$ ccm switch bob     # email 子串即可切换,当前终端立即生效
 ```
 
 ## 为什么
@@ -54,13 +54,18 @@ Profile 不用语义别名(什么 personal/work),注册即自动编号 `a1, a2, 
 定位靠 selector,以下写法全部有效:
 
 ```bash
-ccm use a3               # 精确 id
-ccm use 3                # 纯数字
-ccm use bob@example.com  # 精确 email
-ccm use bob              # email 子串(≥3 字符,不区分大小写)
-ccm use 2399b3           # account uuid 前缀(≥6 字符)
-ccm use --auto           # 切到额度最宽裕的账号
+ccm switch a3               # 精确 id(use 是别名)
+ccm switch 3                # 纯数字
+ccm switch corp             # 自定义名(ccm rename a3 corp 之后)
+ccm switch bob@example.com  # 精确 email
+ccm switch bob              # email 子串(≥3 字符,不区分大小写)
+ccm switch 2399b3           # account uuid 前缀(≥6 字符)
+ccm switch --auto           # 切到额度最宽裕的账号
 ```
+
+**Tab 补全是一等公民**(`ccm init bash` 自动启用):像 git 一样按上下文补——
+`ccm sw<TAB>` → `switch`;`ccm switch <TAB>` → 列出 id + email;
+`ccm usage --<TAB>` → 该命令的全部选项;`ccm shared rm <TAB>` → 共享清单项。
 
 - 同账号多 profile → 自动挑最优(token 有效 > 默认 profile > id 序)
 - 跨账号歧义 → 拒绝并列出候选,**绝不猜**
@@ -127,7 +132,7 @@ ccm init bash                # 安装 shell 集成
 
 | 命令 | 说明 |
 |---|---|
-| `ccm use <sel>` / `ccm use --auto` | 切换(shell 集成下当前终端立即生效) |
+| `ccm switch <sel>` / `--auto` | 切换,别名 `use`(shell 集成下当前终端立即生效) |
 | `ccm current [--quiet]` | 当前 profile |
 | `ccm run <sel> -- <args…>` | 一次性注入环境启动 claude(cron/脚本用) |
 | `ccm shell <sel>` | 开注入好环境的子 shell |

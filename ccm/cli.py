@@ -42,7 +42,7 @@ def cmd_use(args):
         prof = registry.get(name)
     else:
         if not args.name:
-            raise CcmError("用法: ccm use <id|email|序号> 或 ccm use --auto")
+            raise CcmError("用法: ccm switch <id|名字|email|序号> 或 ccm switch --auto")
         prof = _resolve(env, registry, args.name)
     save_state(env, prof.name, "ccm use")
     human = f"已切换到 {prof.name} ({prof.path})"
@@ -286,8 +286,15 @@ def cmd_logout(args):
     from ccm.lifecycle import logout_profile
     from ccm.procs import scan_claude_procs
     env, registry, _ = _env_ctx()
-    scan = scan_claude_procs(env.proc_root, env.user_home)
     args.name = _resolve(env, registry, args.name).name
+    if not args.yes:
+        import sys as _sys
+        if not _sys.stdin.isatty():
+            raise CcmError("logout 会删除凭证且默认不留副本;非交互环境需 -y 确认")
+        if input(f"登出 {args.name}(删除凭证,不留副本)? [y/N] ").strip().lower() != "y":
+            print("已取消")
+            return 1
+    scan = scan_claude_procs(env.proc_root, env.user_home)
     logout_profile(env, registry, args.name, scan=scan, keep_backup=args.keep_backup)
     print(f"{args.name} 已登出" + ("(凭证已备份)" if args.keep_backup else "(未留副本)"))
     return 0
@@ -386,18 +393,73 @@ def cmd_token(args):
 
 
 def cmd_completion(args):
-    cmds = ("add rm rename login logout show ls use current run env init shell "
-            "usage best cost refresh doctor link migrate backup restore export "
-            "import statusline daemon shared unlink diff token completion")
-    print(f'''_ccm() {{
-  local cur=${{COMP_WORDS[COMP_CWORD]}}
-  if [ $COMP_CWORD -eq 1 ]; then
-    COMPREPLY=($(compgen -W "{cmds}" -- "$cur"))
-  else
-    COMPREPLY=($(compgen -W "$(command ccm _complete-names 2>/dev/null)" -- "$cur"))
-  fi
-}}
-complete -F _ccm ccm''')
+    # 上下文补全:子命令 → 该命令 flags → profile 名/email/共享项(引擎在 ccm/complete.py)
+    print("""_ccm_completion() {
+  local IFS=$'\\n'
+  COMPREPLY=($(command ccm _complete "$COMP_CWORD" "${COMP_WORDS[@]}" 2>/dev/null))
+}
+complete -o nosort -F _ccm_completion ccm 2>/dev/null || complete -F _ccm_completion ccm""")
+    return 0
+
+
+def cmd_complete(args):
+    from ccm.complete import complete_words
+    env, registry, _ = _env_ctx()
+    for w in complete_words(env, registry, args.cword, args.words):
+        print(w)
+    return 0
+
+
+GROUPED_HELP = """\
+ccm — Claude 多账号统一管理
+
+常用
+  switch <id|名字|email|序号>   切换账号(别名: use;--auto 切最宽裕的)
+  ls                            列出全部账号(email/订阅/token/分组)
+  usage                         实时限流用量(--watch 面板,--history 趋势)
+  current                       当前账号(-q 只出名字)
+  best                          最宽裕的账号
+
+账号管理
+  add [名字]                    新建(不填自动编号)/ --import 纳管已有目录
+  login / logout <sel>          引导登录 / 删除凭证
+  rename <sel> <新名>           改名(id 与自定义名并存)
+  show / rm <sel>               详情 / 删除(先备份)
+
+运行
+  run <sel> -- <args>           一次性用某账号跑 claude(cron/脚本)
+  shell <sel>                   注入好环境的子 shell
+  env / init bash               export 语句 / shell 集成+补全安装
+
+维护
+  doctor [--fix]                体检修复    refresh <sel|-a>  刷新 token
+  cost / daemon / statusline    本地统计 / 后台采样 / 状态栏
+  backup / restore / export / import / migrate / link / shared / unlink / diff
+
+`ccm help <命令>` 或 `ccm <命令> --help` 看详细参数。
+"""
+
+
+def print_grouped_help(env=None, registry=None, state=None):
+    if state and registry:
+        name = state.get("active")
+        prof = registry.profiles.get(name)
+        if prof:
+            email = prof.email or ""
+            print(f"当前: {name} ({email})\n" if email else f"当前: {name}\n")
+    print(GROUPED_HELP, end="")
+
+
+def cmd_help(args):
+    env, registry, state = _env_ctx()
+    if not args.command:
+        print_grouped_help(env, registry, state)
+        return 0
+    p, sub = build_parser()
+    sp = sub.choices.get(args.command)
+    if sp is None:
+        raise CcmError(f"未知命令: {args.command}")
+    sp.print_help()
     return 0
 
 
@@ -599,7 +661,8 @@ def build_parser():
     sp = sub.add_parser("env", help="输出当前 profile 的 export 语句")
     sp.set_defaults(func=cmd_env)
 
-    sp = sub.add_parser("use", help="切换活跃 profile")
+    sp = sub.add_parser("switch", aliases=["use"],
+                        help="切换账号(id/自定义名/email/序号均可)")
     sp.add_argument("name", nargs="?")
     sp.add_argument("--auto", action="store_true", help="切到额度最宽裕的账号")
     sp.add_argument("--emit-env", action="store_true",
@@ -607,7 +670,7 @@ def build_parser():
     sp.set_defaults(func=cmd_use)
 
     sp = sub.add_parser("current", help="显示当前 profile")
-    sp.add_argument("--quiet", action="store_true")
+    sp.add_argument("-q", "--quiet", action="store_true")
     sp.set_defaults(func=cmd_current)
 
     sp = sub.add_parser("init", help="安装 shell 集成")
@@ -625,10 +688,10 @@ def build_parser():
     sp.set_defaults(func=cmd_doctor)
 
     sp = sub.add_parser("migrate", help="迁移到 ccm 布局")
-    sp.add_argument("--dry-run", action="store_true")
+    sp.add_argument("-n", "--dry-run", action="store_true")
     sp.add_argument("--rollback", action="store_true")
     sp.add_argument("--cleanup", action="store_true")
-    sp.add_argument("--yes", action="store_true")
+    sp.add_argument("-y", "--yes", action="store_true")
     sp.set_defaults(func=cmd_migrate)
 
     sp = sub.add_parser("usage", help="各 account 实时用量")
@@ -673,6 +736,15 @@ def build_parser():
     sp = sub.add_parser("_complete-names")
     sp.set_defaults(func=cmd_complete_names)
 
+    sp = sub.add_parser("_complete")
+    sp.add_argument("cword", type=int)
+    sp.add_argument("words", nargs=argparse.REMAINDER)
+    sp.set_defaults(func=cmd_complete)
+
+    sp = sub.add_parser("help", help="显示帮助")
+    sp.add_argument("command", nargs="?")
+    sp.set_defaults(func=cmd_help)
+
     sp = sub.add_parser("best", help="输出当前最宽裕的 profile")
     sp.add_argument("--json", action="store_true")
     sp.set_defaults(func=cmd_best)
@@ -701,7 +773,7 @@ def build_parser():
     sp = sub.add_parser("rm", help="删除 profile(先备份,含凭证)")
     sp.add_argument("name")
     sp.add_argument("--keep-data", action="store_true", help="只摘注册,不删目录")
-    sp.add_argument("--yes", action="store_true")
+    sp.add_argument("-y", "--yes", action="store_true")
     sp.set_defaults(func=cmd_rm)
 
     sp = sub.add_parser("rename", help="改名")
@@ -715,6 +787,7 @@ def build_parser():
 
     sp = sub.add_parser("logout", help="删除凭证(默认不留副本)")
     sp.add_argument("name")
+    sp.add_argument("-y", "--yes", action="store_true")
     sp.add_argument("--keep-backup", action="store_true")
     sp.set_defaults(func=cmd_logout)
 
@@ -745,8 +818,8 @@ def build_parser():
 
     sp = sub.add_parser("refresh", help="刷新过期 access token(有活跃进程时拒绝)")
     sp.add_argument("name", nargs="?")
-    sp.add_argument("--all", action="store_true")
-    sp.add_argument("--force", action="store_true",
+    sp.add_argument("-a", "--all", action="store_true")
+    sp.add_argument("-f", "--force", action="store_true",
                     help="越过活跃进程保护(CAS 仍生效)")
     sp.set_defaults(func=cmd_refresh)
 
@@ -765,10 +838,21 @@ def build_parser():
 
 
 def main(argv=None):
-    p, _sub = build_parser()
+    import sys as _sys
+    argv = list(_sys.argv[1:]) if argv is None else list(argv)
+    p, sub = build_parser()
+    # git 风格拼错建议:第一个非 flag 词不是已知命令时给 did-you-mean
+    head = next((a for a in argv if not a.startswith("-")), None)
+    if head and head not in sub.choices:
+        import difflib
+        cand = difflib.get_close_matches(head, list(sub.choices), n=3, cutoff=0.5)
+        hint = f"你是不是想输: {', '.join(cand)}" if cand else "ccm help 查看全部命令"
+        print(f"ccm: 未知命令 {head!r}。{hint}", file=_sys.stderr)
+        return 1
     args = p.parse_args(argv)
     if args.func is None:
-        p.print_help()
+        env, registry, state = _env_ctx()
+        print_grouped_help(env, registry, state)
         return 0
     rc, _ = _dispatch_guard(lambda: args.func(args))
     return rc

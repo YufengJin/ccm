@@ -91,11 +91,11 @@ class TestTokenCompletion(Base):
         self.assertEqual(rc, 0)
         self.assertTrue(out.strip().startswith("sk-ant-oat"))
 
-    def test_completion_lists_commands(self):
+    def test_completion_script_uses_engine(self):
         rc, out, _ = self.run_cli("completion", "bash")
         self.assertEqual(rc, 0)
-        for w in ("use", "usage", "migrate", "doctor"):
-            self.assertIn(w, out)
+        self.assertIn("_complete", out)                # 走上下文引擎
+        self.assertIn("complete -o nosort -F", out)
 
     def test_complete_names_hidden(self):
         rc, out, _ = self.run_cli("_complete-names")
