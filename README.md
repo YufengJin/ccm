@@ -92,16 +92,31 @@ ccm switch --auto           # 切到额度最宽裕的账号
 
 ## 安装
 
-```bash
-git clone https://github.com/YufengJin/ccm && cd ccm
-./install.sh                 # symlink 到 ~/.local/bin/ccm
-# 或
-pip install .
+一句话装好(clone + 装入 `~/.local/bin` + shell 集成/Tab 补全):
 
-ccm migrate --dry-run        # 先看迁移计划
-ccm migrate                  # 把现有 ~/.claude* 布局迁入 ccm 管理(全程可回滚)
-ccm init bash                # 安装 shell 集成
+```bash
+git clone https://github.com/YufengJin/ccm ~/.local/share/ccm && ~/.local/share/ccm/install.sh && ~/.local/bin/ccm init bash
 ```
+
+已有 pipx 的话也可以:
+
+```bash
+pipx install git+https://github.com/YufengJin/ccm && ccm init bash
+```
+
+装完后把现有 `~/.claude*` 布局迁入 ccm 管理(全程 journal 可回滚):
+
+```bash
+ccm migrate -n     # 先看迁移计划(dry-run)
+ccm migrate        # 确认后执行
+```
+
+> **让 Claude Code 帮你装**:把下面这句直接丢给它——
+>
+> ```
+> 按 https://github.com/YufengJin/ccm 的 README 一句话安装 ccm,
+> 然后跑 ccm migrate -n 把迁移计划给我看,先不要真迁移。
+> ```
 
 ### 迁移安全性
 
