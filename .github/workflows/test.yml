@@ -3,6 +3,7 @@ on:
   push:
     branches: [master, main]
   pull_request:
+  workflow_dispatch:
 jobs:
   unittest:
     runs-on: ubuntu-latest
