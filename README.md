@@ -216,7 +216,7 @@ ccm 的防线(按序):
 ## 开发
 
 ```bash
-python3 -m unittest discover -s tests    # 202 个测试,全部隔离(不触碰真实 HOME)
+python3 -m unittest discover -s tests    # 205 个测试,全部隔离(不触碰真实 HOME)
 ```
 
 测试通过 `CCM_USER_HOME` / `CCM_HOME` / `CCM_PROC_ROOT` 等环境变量把一切路径注入

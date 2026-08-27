@@ -407,22 +407,40 @@ def execute_migration(env, plan, backup=True):
     journal.clear()
 
 
-def cleanup(env):
+def cleanup(env, scan=None):
     """长跑进程结束后:删兼容 symlink(default 的 ~/.claude 永久保留——
-    它是未设 CLAUDE_CONFIG_DIR 时 claude 的默认落点);.bashrc 只报告不自动改。"""
+    它是未设 CLAUDE_CONFIG_DIR 时 claude 的默认落点);.bashrc 只报告不自动改。
+
+    活跃进程门禁:§10 的「长跑进程结束后」不能只靠用户自觉 —— 有进程的
+    CLAUDE_CONFIG_DIR 还指着某条兼容链接时删它,该进程后续按路径 open 会直接
+    ENOENT。逐条检查,被占用的跳过并提示(实际清理时踩出来的)。
+    """
     from ccm.config import Registry
+    from ccm.procs import UNKNOWN, profile_active_pids, scan_claude_procs
     actions = []
     registry = Registry.load(env)
+    if scan is None:
+        scan = scan_claude_procs(env.proc_root, env.user_home)
     changed = False
     for prof in registry.profiles.values():
         if prof.name == registry.default_profile:
             continue   # 默认落点的 ~/.claude 永久保留
         cl = prof.compat_link
-        if cl and cl.is_symlink():
-            os.unlink(cl)
-            prof.compat_link = None   # 注册表同步,否则 doctor 报兼容链接缺失
-            changed = True
-            actions.append(f"已删除兼容链接 {cl}")
+        if not (cl and cl.is_symlink()):
+            continue
+        pids = profile_active_pids(prof.path, cl, scan)
+        if pids:
+            actions.append(f"跳过 {cl}: 有活跃 claude 进程 {sorted(pids)}"
+                           f"(等它们退出后重跑 ccm migrate --cleanup)")
+            continue
+        os.unlink(cl)
+        prof.compat_link = None   # 注册表同步,否则 doctor 报兼容链接缺失
+        changed = True
+        actions.append(f"已删除兼容链接 {cl}")
+    if scan.get(UNKNOWN):
+        actions.append(f"注意: 有 {len(scan[UNKNOWN])} 个无法归属的疑似 claude 进程"
+                       f"{sorted(scan[UNKNOWN])},已按不占用处理;若清理后它们报错,"
+                       f"用 ccm doctor --fix 重建链接")
     if changed:
         registry.save(env)
     rc = env.user_home / ".bashrc"

@@ -552,6 +552,47 @@ class TestDurability(Base):
         self.assertGreaterEqual(len(calls), 2, "文件与父目录都要 fsync")
 
 
+class TestCleanupActiveGate(Base):
+    """cleanup 的活跃进程门禁:实际清理时踩出来的 —— 有进程还挂在兼容链接上时
+    删链接,它后续按路径 open 直接 ENOENT。§10 的「长跑进程结束后」必须由代码
+    把关,不能只靠用户自觉。"""
+
+    def setUp(self):
+        super().setUp()
+        execute_migration(self.env, build_plan(self.env), backup=False)
+        self.registry = Registry.load(self.env)
+
+    def test_skips_compat_link_with_active_process(self):
+        from ccm.migrate import cleanup
+        scan = {os.path.realpath(self.tmp / ".claude-b"): {4242}}
+        actions = cleanup(self.env, scan=scan)
+        self.assertTrue((self.tmp / ".claude-b").is_symlink(), "被占用的不能删")
+        self.assertFalse(os.path.lexists(self.tmp / ".claude-a"), "没被占用的照删")
+        self.assertTrue(any("跳过" in a and "4242" in a for a in actions))
+        # 注册表:被跳过的 compat_link 必须保留,下次还能清
+        reg = Registry.load(self.env)
+        self.assertIsNotNone(reg.get("a3").compat_link)
+        self.assertIsNone(reg.get("a2").compat_link)
+
+    def test_rerun_after_process_exits_finishes_the_job(self):
+        from ccm.migrate import cleanup
+        cleanup(self.env, scan={os.path.realpath(self.tmp / ".claude-b"): {4242}})
+        actions = cleanup(self.env, scan={})    # 进程退出后重跑
+        self.assertFalse(os.path.lexists(self.tmp / ".claude-b"))
+        self.assertTrue(any("已删除" in a and ".claude-b" in a for a in actions))
+        self.assertIsNone(Registry.load(self.env).get("a3").compat_link)
+
+    def test_unknown_procs_warn_but_do_not_block(self):
+        """UNKNOWN 桶只提示不拦截:删链接可用 doctor --fix 恢复,而永久拦截会让
+        cleanup 在有任何不可读进程的机器上永远跑不完(与 refresh 的保守策略相反,
+        那边猜错是不可逆的掉线)。"""
+        from ccm.migrate import cleanup
+        from ccm.procs import UNKNOWN
+        actions = cleanup(self.env, scan={UNKNOWN: {7777}})
+        self.assertFalse(os.path.lexists(self.tmp / ".claude-b"))
+        self.assertTrue(any("7777" in a for a in actions))
+
+
 class TestStatuslineIsSessionScoped(Base):
     """statusline 报的必须是**本会话**的账号,不是全局 state。"""
 
