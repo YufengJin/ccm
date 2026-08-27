@@ -17,6 +17,7 @@ class AccountRow:
     email: Optional[str]
     profiles: List[str] = field(default_factory=list)
     source: str = "unavailable"      # live | cache | unavailable
+    probe_profile: Optional[str] = None   # live 行:实际查通的那个 profile
     five_hour_pct: Optional[int] = None
     seven_day_pct: Optional[int] = None
     five_hour_resets: Optional[str] = None
@@ -25,13 +26,44 @@ class AccountRow:
     detail: str = ""
 
 
+def _parse_reset(value):
+    """resets_at → aware datetime;认不出就 None。
+
+    服务端可能给 ISO 串(带 Z 或 +00:00)、也可能给 epoch 秒/毫秒。之前只 try
+    fromisoformat 且只捕 ValueError,数字会抛 TypeError 冲垮整个 usage/ls/best;
+    另外 Python 3.10 的 fromisoformat 不认 "Z" 后缀(CI 矩阵含 3.10)。
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        v = float(value)
+        if v > 1e11:          # 毫秒
+            v /= 1000.0
+        try:
+            return datetime.fromtimestamp(v, timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+    if not isinstance(value, str):
+        return None
+    s = value.strip()
+    if s[-1:] in ("Z", "z"):
+        s = s[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(s)
+    except ValueError:
+        pass
+    try:
+        return _parse_reset(float(s))
+    except ValueError:
+        return None
+
+
 def _countdown(resets_at, now=None):
-    """ISO 时间 → '3h12m' 剩余;解析失败 → None。"""
+    """ISO 时间 / epoch → '3h12m' 剩余;解析失败 → None。"""
     if not resets_at:
         return None
-    try:
-        target = datetime.fromisoformat(resets_at)
-    except ValueError:
+    target = _parse_reset(resets_at)
+    if target is None:
         return None
     if target.tzinfo is None:
         target = target.replace(tzinfo=timezone.utc)
@@ -48,17 +80,38 @@ def extract_pcts(payload, now=None):
     out = {"five_hour_pct": None, "seven_day_pct": None,
            "five_hour_resets": None, "seven_day_resets": None}
     kind_map = {"session": "five_hour", "weekly_all": "seven_day"}
+
+    def _pct(v):
+        try:
+            return int(float(v))
+        except (TypeError, ValueError):
+            return None
+
+    if not isinstance(payload, dict):
+        return out
     for lim in payload.get("limits") or []:
+        if not isinstance(lim, dict):
+            continue
         slot = kind_map.get(lim.get("kind"))
-        if slot and lim.get("percent") is not None:
-            out[f"{slot}_pct"] = int(lim["percent"])
+        if not slot:
+            continue
+        pct = _pct(lim.get("percent"))
+        if pct is not None:
+            out[f"{slot}_pct"] = pct
+        # pct 与 resets 各自回退:limits 给了 percent 但 resets_at 缺失/损坏时,
+        # 仍然允许 legacy 对象补上倒计时(codex 审核发现)。
+        if out[f"{slot}_resets"] is None:
             out[f"{slot}_resets"] = _countdown(lim.get("resets_at"), now)
     for slot in ("five_hour", "seven_day"):
+        obj = payload.get(slot) or {}
+        if not isinstance(obj, dict):
+            continue
         if out[f"{slot}_pct"] is None:
-            obj = payload.get(slot) or {}
-            if obj.get("utilization") is not None:
-                out[f"{slot}_pct"] = int(obj["utilization"])
-                out[f"{slot}_resets"] = _countdown(obj.get("resets_at"), now)
+            pct = _pct(obj.get("utilization"))
+            if pct is not None:
+                out[f"{slot}_pct"] = pct
+        if out[f"{slot}_resets"] is None:
+            out[f"{slot}_resets"] = _countdown(obj.get("resets_at"), now)
     return out
 
 
@@ -90,26 +143,31 @@ def gather_usage(env, registry, opener=None, now_ms=None):
     for uuid, g in sorted(groups.items()):
         row = AccountRow(account_uuid=uuid, email=g["email"],
                          profiles=sorted(p.name for p in g["profiles"]))
-        # 1) 在未过期 token 中选 expiresAt 最晚的
-        best = None
+        # 1) 未过期的 token 按到期时间从晚到早**逐个**试。只试最晚那枚的话,
+        #    它一旦被服务端撤销,整组就被错误降级成 cache/unavailable。
+        cands = []
         for prof in g["profiles"]:
             try:
                 creds = read_credentials(prof.path)
             except CredentialsMissing:
                 continue
             if creds and not token_state(creds, now_ms)["expired"]:
-                if best is None or creds["expiresAt"] > best["expiresAt"]:
-                    best = creds
-        if best:
+                cands.append((creds.get("expiresAt", 0), prof, creds))
+        cands.sort(key=lambda c: -c[0])
+        for _exp, prof, creds in cands:
             try:
-                payload = fetch_usage(best["accessToken"], opener=opener)
-                row.source = "live"
-                for k, v in extract_pcts(payload).items():
-                    setattr(row, k, v)
-                rows.append(row)
-                continue
+                payload = fetch_usage(creds["accessToken"], opener=opener)
             except ApiError as e:
                 row.detail = str(e)
+                continue
+            row.source = "live"
+            row.probe_profile = prof.name
+            for k, v in extract_pcts(payload).items():
+                setattr(row, k, v)
+            break
+        if row.source == "live":
+            rows.append(row)
+            continue
         # 2) 降级:组内最新的 cachedUsageUtilization
         freshest = None
         for prof in g["profiles"]:
@@ -153,7 +211,12 @@ def pick_best(rows, registry, env):
     best = min(eligible, key=score)
     from ccm.selector import pick_preferred
     cand = [registry.profiles[n] for n in best.profiles if n in registry.profiles]
-    chosen = pick_preferred(cand, registry).name if cand else sorted(best.profiles)[0]
+    if best.probe_profile and best.probe_profile in registry.profiles:
+        # 只有它的 token 是**被服务端确认过**可用的;别的 profile 可能 expiresAt
+        # 还没到但已被撤销,按「未过期 > 默认」重选会切到那种死号(codex 审核发现)
+        chosen = best.probe_profile
+    else:
+        chosen = pick_preferred(cand, registry).name if cand else sorted(best.profiles)[0]
     reason = (f"{best.email or best.account_uuid}: "
               f"5h={best.five_hour_pct}% 7d={best.seven_day_pct}% "
               f"(max={max(best.five_hour_pct or 0, best.seven_day_pct or 0)}, "

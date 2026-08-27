@@ -14,7 +14,8 @@ from ccm.config import load_state, save_state, validate_profile_name
 from ccm.errors import CcmError
 from ccm.identity import read_credentials, resolve_identity
 from ccm.layout import apply_links, link_plan
-from ccm.migrate import Journal, move_dir_with_compat
+from ccm.migrate import (OP_JOURNAL, Journal, assert_no_pending_migration,
+                         move_dir_with_compat)
 from ccm.oauth import token_state
 from ccm.procs import profile_active_pids
 from ccm.profiles import Profile
@@ -37,16 +38,22 @@ def add_profile(env, registry, name=None, note="", import_dir=None, move=False):
         import_dir = Path(import_dir)
         if not import_dir.is_dir():
             raise CcmError(f"导入目录不存在: {import_dir}")
+        # 先查重再动文件:同一目录被两个 profile 纳管会让 rm/link 互相踩
+        dup = next((n for n, q in registry.profiles.items()
+                    if os.path.realpath(q.path) == os.path.realpath(import_dir)), None)
+        if dup:
+            raise CcmError(f"该目录已被 profile {dup} 纳管: {import_dir}")
         if move:
-            new = env.accounts_root / name
-            j = Journal.load(env)
+            assert_no_pending_migration(env)   # 绝不与未完结的 migrate 抢 journal
+            new = registry.accounts_root / name
+            j = Journal.load(env, OP_JOURNAL)  # 独立 journal,不碰 migrate 的
             move_dir_with_compat(import_dir, new, j)
             j.clear()  # 单目录迁移即完即清(整体 migrate 才需要留 journal)
             path, compat = new, import_dir
         else:
             path, compat = import_dir, None   # 原地纳管,不动文件
     else:
-        path = env.accounts_root / name
+        path = registry.accounts_root / name
         if os.path.lexists(path):
             raise CcmError(f"目录已被占用: {path}")
         path.mkdir(parents=True)
@@ -80,6 +87,9 @@ def remove_profile(env, registry, name, scan=None, keep_data=False):
     _refuse_active(prof, scan, "删除")
     bak = None
     if not keep_data:
+        if prof.path.is_symlink():
+            raise CcmError(f"{name} 的路径是一个 symlink({prof.path}),"
+                           f"不确定该删链接还是删目标;请用 --keep-data 摘注册后手工处理")
         bak = _backup_profile(env, prof, "rm")
         shutil.rmtree(prof.path)
         if prof.compat_link and prof.compat_link.is_symlink():
@@ -88,9 +98,16 @@ def remove_profile(env, registry, name, scan=None, keep_data=False):
     registry.save(env)
     state = load_state(env)
     if state and state.get("active") == name:
-        save_state(env, registry.default_profile
-                   if registry.default_profile in registry.profiles
-                   else sorted(registry.profiles)[0], "ccm rm 回落")
+        fallback = registry.default_profile \
+            if registry.default_profile in registry.profiles \
+            else (sorted(registry.profiles)[0] if registry.profiles else None)
+        if fallback:
+            save_state(env, fallback, "ccm rm 回落")
+        else:   # 删光了:清掉 state,而不是崩在 sorted([])[0]
+            try:
+                os.unlink(env.ccm_home / "state.json")
+            except FileNotFoundError:
+                pass
     return bak
 
 
@@ -101,8 +118,10 @@ def rename_profile(env, registry, old, new, scan=None):
     prof = registry.get(old)
     _refuse_active(prof, scan, "改名")
     new_path = prof.path
-    if prof.path.parent == env.accounts_root:   # 只有住在 accounts_root 里才改目录名
-        new_path = env.accounts_root / new
+    if prof.path.parent == registry.accounts_root:  # 只有住在 accounts_root 里才改目录名
+        new_path = registry.accounts_root / new
+        if os.path.lexists(new_path):
+            raise CcmError(f"目标目录已存在: {new_path}")
         os.rename(prof.path, new_path)
         if prof.compat_link and prof.compat_link.is_symlink():
             os.unlink(prof.compat_link)
@@ -146,13 +165,20 @@ def login_profile(env, registry, name, claude_bin="claude"):
     ident = resolve_identity(prof.path, env.user_home,
                              allow_legacy=(name == registry.default_profile)) or {}
     if ident.get("account_uuid"):
-        prof.account_uuid = ident["account_uuid"]
-        prof.email = ident.get("email")
-        prof.subscription = ident.get("subscription")
-        prof.rate_limit_tier = ident.get("rate_limit_tier")
-        prof.identity_fetched_at = int(time.time() * 1000)
+        # 登录可能持续几分钟,不能全程占着注册表锁;回来后才在事务里回填,
+        # 且以磁盘上的最新注册表为准(期间可能有别的 ccm 改过)。
+        from ccm.config import registry_transaction
+        with registry_transaction(env) as fresh:
+            target = fresh.profiles.get(name)
+            if target is None:
+                return rc   # 期间被删了,不复活
+            for obj in (target, prof):
+                obj.account_uuid = ident["account_uuid"]
+                obj.email = ident.get("email")
+                obj.subscription = ident.get("subscription")
+                obj.rate_limit_tier = ident.get("rate_limit_tier")
+                obj.identity_fetched_at = int(time.time() * 1000)
         registry.profiles[name] = prof
-        registry.save(env)
     return rc
 
 

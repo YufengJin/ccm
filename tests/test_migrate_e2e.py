@@ -71,7 +71,7 @@ class TestMigrateE2E(unittest.TestCase):
         plan = build_plan(self.env)
         # 保留 journal 以便回滚:打桩 doctor 让阶段 6 失败
         orig = M._doctor_gate
-        M._doctor_gate = lambda env: ["注入的失败"]
+        M._doctor_gate = lambda env, plan=None: ["注入的失败"]
         try:
             with self.assertRaises(MigrationAborted):
                 execute_migration(self.env, plan)

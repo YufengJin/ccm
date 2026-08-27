@@ -452,3 +452,181 @@ P0 完成即可完全替代 `cca`/`ccb` 并具备用量可见性。
 6. **`~/.claude.json` 保持原位不动。** 旧版遗留路径仍被 Claude Code 读取,由 doctor 提示但不迁移。
 7. **「tmp+rename」式保存会把共享 symlink 替换成实体文件。** 任何程序(含 Claude Code)对 `settings.json` 这类共享文件做原子保存时,rename 落在 profile 目录内,会静默断开共享。这在现有手工 symlink 方案同样存在;ccm 的缓解是 doctor 检出为 conflict 并报告(绝不自动覆盖),由用户决定收编或独立。
 8. **Python 版本下限以实际测试矩阵为准**(开发机与 目标机的实际版本),不对未测版本做兼容主张。
+
+---
+
+## 16. 2026-08-27 深度审查修订(含 codex 交叉审查)
+
+本轮针对已实现代码做设计逻辑复查(两轮交叉审查),共修掉 45 项,
+其中 9 项属数据丢失或安全级。§16.1–16.8 是第一轮,§16.9 是 codex 复审的第二轮。以下是**改变了既定行为**、
+需要记入设计的部分;纯健壮性加固(空值/类型/参数校验)不逐条列出。
+
+### 16.1 注册表并发(§12 补强)
+
+原实现只把 `Registry.save()` 包在 flock 里,`load` 在锁外 —— 并发 `ccm add` 会丢更新。
+新增 `registry_transaction(env)`:**读-改-写全程持锁,锁内重新 load**。
+所有变更注册表的命令(`add`/`rm`/`rename`/`logout`/`shared`/`unlink`/`restore`/`import`)
+统一走它。为此 `registry_lock` 改为**进程内可重入**(flock 按 open file description
+计,同进程二次取 `LOCK_EX` 会自锁死)。
+
+交互确认(`rm`/`logout` 的 y/N)一律在进锁**之前**完成,不占着锁等人。
+`login` 同理:`claude` 子进程跑完才进事务回填身份,不在登录期间占锁。
+
+### 16.2 迁移(§10 修订)
+
+- **阶段 4 现在为「全部 profile」铺链**,不只是 `plan["moves"]` 里搬过来的那三个。
+  迁移前就 `ccm add` 过的 profile,当时 `shared_root` 还是空的(`skip_no_source`),
+  只有此刻才补得上;不补的话阶段 6 的 doctor 门禁会判 fail 并回滚整个迁移。
+- **阶段 4 用 `Registry.load()` 而非 `Registry.empty()`**:既有 profile 不再被抹掉。
+- **`build_plan` 增加名字冲突预检**:`a1/a2/a3` 已被注册表占用时中止,提示先 rename。
+- **失败路径改为还原快照**:进入迁移前先记下 `profiles.json`/`state.json` 的内容,
+  异常时写回原样(原来是无条件 `unlink`,会删掉用户既有注册表)。
+
+### 16.3 journal 隔离
+
+`add --import --move` 与 `shared add --from` 原来复用 migrate 的 journal 并在结束时
+`clear()` —— 迁移崩溃后跑一次这两个命令,回滚基线就永久没了。改为:
+
+- journal 文件按用途分离:`migrate-journal.json` / `op-journal.json`;
+- 单步搬迁前调 `assert_no_pending_migration(env)`,有未完结迁移直接拒绝执行。
+
+### 16.4 凭证刷新(§9 修订)
+
+- **锁键会跟着轮换走**:`refresh` 的 account 锁按 refresh token 指纹建立,而指纹在
+  持锁重读(CAS#1)后可能已经变了。原实现继续用旧指纹的锁 = 等于没锁。现在发现
+  指纹变化就**换新指纹重新加锁**(上限 3 次,超过判 `abandoned-cas`)。
+- **同源凭证一并同步**:同一 account 下由目录复制得来的多个 profile 持有同一份
+  refresh token;只回写当前 profile 的话,兄弟手里那份已被服务端作废,表现为
+  「另一个账号莫名掉线」。刷新成功后遍历兄弟 profile,凭证同源的一起更新。
+- **写回前备份**:落盘前把整份 `.credentials.json` 备份到 `~/.ccm/backups/`(0600),
+  这是 §9 原本就要求的。
+- **200 但无 `access_token` 视同失败**:服务端返回 `{"error": …}` 却给 200 时,
+  旧 refresh token 可能已被轮换 —— 一律不写入,提示 `ccm login`。
+- **`--force` 需要确认**:交互环境询问 y/N,非交互环境必须同时给 `-y`。
+
+### 16.5 活跃进程判定(§9 修订)
+
+`/proc/<pid>/environ` 读不到时原来直接 `continue`,等于当成「没有进程」,与
+§9「未知状态一律按有活跃进程处理」相反。现在退回读**世界可读的 `cmdline`**:
+像 claude 的进程丢进 `procs.UNKNOWN` 桶。`profile_active_pids(..., include_unknown=True)`
+才把这个桶算进来 —— 只有 `refresh` 这种「猜错就掉线」的操作用它;
+`rm`/`logout` 保持按精确归属判定,避免被无关进程永久挡住。
+
+### 16.6 解包安全(§7 修订)
+
+`restore`/`import` 用 `filter="tar"` 而非 `"data"`,是为了允许 profile 里指向
+`shared_root` 的绝对 symlink。但 `tar` 过滤器**不校验链接目标**,于是:
+
+> 归档的**唯一顶层成员**做成一条指向任意目录的绝对 symlink → 提升为 profile 目录 →
+> 随后 `apply_links` 顺着它往那个目录里写 symlink。
+
+修法:解包后、提升前复核 `staging/<top>` 是**普通目录而非 symlink**,提升后再复核一次。
+另外补上 §7 原本要求的手写兜底 —— 老 Python 没有 `extractall(filter=)` 参数时,
+用等价校验(拒绝绝对路径 / `..` 穿越 / 设备节点 / 指向外部的硬链接)。
+
+### 16.7 shell 集成(§8 修订)
+
+rc 块解析二进制位置原来用 `command -v ccm`。**二次 `source ~/.bashrc` 时它会命中
+块里定义的同名函数**,`_CCM_BIN` 变成字符串 `ccm`,函数于是调用自己 ——
+无限递归,bash 段错误。同样的兜底 `${_CCM_BIN:-ccm}` 也是递归入口。
+
+改为 `type -P ccm`(只查 PATH,不看函数/别名/内建),且任何兜底路径都不再出现裸
+`ccm`;解析不到时打印一行提示并 `return 127`。
+
+### 16.8 其他行为变更
+
+- `Registry.load` 校验 `shared_root`/`accounts_root` 互不嵌套、也不与 profile 路径
+  嵌套(§6 原本就写了,之前没实现)。
+- `registry.accounts_root` 此前全仓无人读取(`add`/`rename`/`restore` 都直接用
+  `env.accounts_root`);现已改为以注册表为准。`cost` 的 jsonl 扫描同理改用
+  `registry.shared_root`。
+- `cost` 增量扫描补上 **mtime 倒退**触发整文件重扫(§9 要求);`--since` 改为参数化
+  查询,不再拼 SQL 字符串。
+- `doctor --fix` 修完共享链接会**复核结果**再定级,不再把没修成的报成 `ok`。
+- `ccm rm` 拒绝删除路径本身是 symlink 的 profile(该删链接还是删目标不明确)。
+- `--since` / `--history` 收到非 `Nd` 格式给人话错误;`Ctrl-C` 与管道断开不再吐 traceback。
+
+### 16.9 第二轮交叉审查(codex 复审迁移/增量扫描/定位符)
+
+#### cost 增量扫描的两个漏计
+
+- **同 inode 的 truncate-and-rewrite**。写入方 `ftruncate(0)` 后在下次扫描前重写到
+  ≥ 旧 size,`ino/size/mtime` 三项全部「正常」,扫描器从旧 offset 续读 —— 旧事件
+  变幽灵、新文件前缀漏计。**条数甚至可能还对,内容是错的**。
+  修法:`files` 表加 `head` 列,存**已消费前缀**(`min(offset, 4096)` 字节)的摘要,
+  每次扫描前比对;不一致即整文件重扫。
+- **重置状态不落盘**。检测到需要重扫时先 `DELETE`,若接着遇到半行就 `continue`,
+  `files` 行还停在旧 offset,下一轮又从旧 offset 续读。
+  修法:重置时立刻把 `files` 行写成 `offset=0, size=0, mtime=0` 并提交。
+
+#### events 主键加 `src`
+
+同一 `(sid,rid,uid)` 可能同时存在于多个 jsonl(跨账号 `--resume` 会把历史复制进新
+文件)。旧主键不含 `src`,于是 A 被原子替换时 `DELETE src=A` 把那条事件删掉,而未
+变化的 B 不会重扫 —— **事件永久漏计**。主键改为 `(sid,rid,uid,src)`,聚合时在内层
+按 `(sid,rid,uid)` 去重,多源不会重复计数。usage.db 用 `PRAGMA user_version` 做
+schema 版本:升级时只 drop `files`/`events`(纯派生,重扫即得),`sess_profile`
+(归因映射,session-env 清理后无法重建)与 `samples` 保留。
+
+#### 迁移原语
+
+- **`split_item` 把任意 symlink 当「已拆分」**。迁移前 `settings.json` 已链到
+  dotfiles 仓库时,`shared_root` 里根本不生成源,所有 profile 都 `skip_no_source`,
+  迁移却报成功 —— 共享其实没建立。改为只有**精确指向**预期共享项才算幂等,
+  其他指向一律中止并给出处理建议。
+- **relink 回滚无条件删链接**。intent 落盘后崩溃、别的进程在该路径建了链接,
+  `--rollback` 会把它删掉。改为 `prev/new/absent` 严格状态机:只删指向本次写入
+  `new` 的链接;已是 `prev` 视为幂等;其他状态拒绝并保留 journal。
+- **rename 会覆盖竞态创建的目标**。「先 lstat 再 `os.rename`」的事后类型复核发现
+  不了抢占者。改用 `renameat2(RENAME_NOREPLACE)`(ctypes 调 glibc);内核或文件
+  系统不支持时(`ENOSYS`/`EINVAL`)退回原来的尽力而为版本。
+- **mkdir 先于 intent**。两句之间被 SIGKILL 会留下没人认领的 root,
+  `--rollback` 说无事可回滚。改为先写 intent 再建目录。
+- **journal 不 fsync**,§10 的「断电后可续跑」承诺不成立。`atomic_write_json` 改为
+  写 tmp → `fsync` → `replace` → `fsync` 父目录;`_staged_swap` 每次 rename/symlink
+  后同步受影响目录再写 `done`。环境变量 `CCM_FSYNC=0` 可关闭(**仅供测试提速**,
+  开着会让每个迁移类测试多花近 1 秒;关掉只影响断电场景,崩溃场景不受影响)。
+
+#### 阶段 6 门禁的死不变量
+
+`shared-source` 列在 `INVARIANT_CHECKS` 里,但 doctor 对它**只会产出 warn**
+(清单里的可选项本来就允许不存在),而门禁只筛 fail —— 这条不变量实际上是死的。
+改为门禁按**本次 `plan["splits"]`** 单独校验:计划里说要拆出去的源必须真的落在
+`shared_root`。
+
+#### 定位符
+
+- **email 子串与 uuid 前缀被塞进同一匹配级**,不符合 §4 的逐级短路。
+  「同时是 A 的 email 子串和 B 的 uuid 前缀」会被误判成跨账号歧义。已拆成三级短路。
+- **空 uuid 被排除出歧义判定**,把「无法证明同 account」当成了「同 account」,
+  于是静默挑一个。改为:多命中时只要有任一候选 uuid 为空就报歧义。
+
+#### 用量探测
+
+- **只试 `expiresAt` 最晚的那枚 token**,失败就整组降级 cache。改为按到期时间
+  从晚到早逐个试,全失败才降级。
+- **`pick_best` 不知道哪枚 token 真的查通了**,按「未过期 → 默认 profile」重选,
+  可能切到一个 `expiresAt` 未到但已被服务端撤销的死号。`AccountRow` 新增
+  `probe_profile` 记录探测成功的 profile,live 行优先返回它。
+- **`limits[]` 给了 percent 就连带阻止 `resets_at` 回退**。改为 percent 与 resets
+  各自独立回退。
+
+#### doctor / shell 集成
+
+- **`state.json` 整个缺失时不产生任何 `state` 结果**(旧代码是 `if state:`),
+  迁移阶段 6 因此看不见「没有活跃 profile」。改为注册表非空而 state 无效即 fail,
+  `--fix` 回落到默认 profile。
+- **`ccm switch --help` 的帮助文本被 eval**。wrapper 会追加 `--emit-env`,argparse
+  以 0 返回帮助,随后 `eval` 把 `usage:`、`options:` 逐行当命令执行。改为 `-h/--help`
+  直通,且只 eval 形如 `export CLAUDE_CONFIG_DIR=…` 的单行输出。
+- **补全注册加交互守卫**(`case $- in *i*`)。启动时的 `eval "$(ccm env)"`
+  **故意不加**——「所有新开的终端立即生效」是 state 层的核心语义,ssh 会话也算
+  终端,而代价只有一次约 35ms 的 `ccm env`。
+
+#### 未采纳的一条
+
+codex 建议把 doctor 中**无法自动修复的实体 conflict** 从 warn 提到 fail(理由:
+`--fix` 后退出码仍为 0,自动化会误判布局健康)。**不采纳**:`ccm unlink` 是文档
+化的正常操作,它产生的正是实体文件 + 清单里仍有该项的状态。提成 fail 会让
+`ccm doctor` 在一次合法 `unlink` 之后**永久返回非零**。保持 warn,由 `ccm doctor`
+的输出而非退出码承担这个信息。

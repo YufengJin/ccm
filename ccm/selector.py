@@ -60,16 +60,27 @@ def resolve_profile(env, registry, selector):
         return registry.profiles[f"a{selector}"]
     sel = selector.lower()
     idents = _identities(env, registry)
-    exact = [t for t in idents if t[1].lower() == sel]
-    matches = exact or [
-        t for t in idents
-        if (len(sel) >= 3 and sel in t[1].lower())
-        or (len(sel) >= 6 and t[2] and t[2].lower().startswith(sel))]
+    # 逐级短路(design §4):前一级有命中就不再看后一级。以前 email 子串与 uuid
+    # 前缀塞在同一级,「同时是 A 的 email 子串和 B 的 uuid 前缀」会被误判为歧义。
+    for matches in (
+            [t for t in idents if t[1].lower() == sel],                   # 精确 email
+            [t for t in idents if len(sel) >= 3 and sel in t[1].lower()],  # email 子串
+            [t for t in idents                                             # uuid 前缀
+             if len(sel) >= 6 and t[2] and t[2].lower().startswith(sel)]):
+        if matches:
+            break
+    else:
+        matches = []
     if not matches:
         listing = ", ".join(f"{p.name}={e or '?'}" for p, e, _ in idents)
         raise ProfileNotFound(f"没有匹配 {selector!r} 的 profile(现有: {listing})")
-    uuids = {u for _, _, u in matches if u}
-    if len(uuids) > 1:
-        listing = ", ".join(f"{p.name}={e}" for p, e, _ in matches)
-        raise CcmError(f"{selector!r} 命中多个不同账号,请说更具体: {listing}")
+    if len(matches) > 1:
+        uuids = {u for _, _, u in matches}
+        # 空 uuid = 「无法证明同属一个 account」,不能当成同 account 静默挑一个。
+        # 自动挑选的前提是全部候选都有**同一个非空** uuid(codex 审核发现)。
+        if len(uuids) > 1 or "" in uuids:
+            listing = ", ".join(f"{p.name}={e or '?'}" for p, e, _ in matches)
+            raise CcmError(
+                f"{selector!r} 命中多个 profile 且无法确认同属一个账号,"
+                f"请说更具体: {listing}")
     return pick_preferred([p for p, _, _ in matches], registry)

@@ -64,7 +64,9 @@ class TestMoveDir(Base):
     def test_second_rename_failure_restores(self):
         old = self.tmp / ".claude-b"
         new = self.tmp / "accounts" / "work"
-        real_rename = os.rename
+        # 注入点是 rename_noreplace(不再是 os.rename):_staged_swap 改用它
+        # 以拒绝竞态创建的目标
+        real_rename = M.rename_noreplace
         calls = []
 
         def flaky(src, dst):
@@ -73,12 +75,12 @@ class TestMoveDir(Base):
                 raise OSError("注入失败")
             real_rename(src, dst)
 
-        M.os.rename = flaky
+        M.rename_noreplace = flaky
         try:
             with self.assertRaises(OSError):
                 move_dir_with_compat(old, new, self.journal)
         finally:
-            M.os.rename = real_rename
+            M.rename_noreplace = real_rename
         self.assertTrue(old.is_dir())
         self.assertFalse(old.is_symlink())
         self.assertFalse(list(self.tmp.glob("*.ccm-staging")))

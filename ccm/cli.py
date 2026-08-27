@@ -1,6 +1,7 @@
 import argparse
 import os
 import sys
+from contextlib import contextmanager
 
 from ccm import __version__
 from ccm.errors import CcmError, ProfileNotFound
@@ -10,6 +11,27 @@ def _env_ctx():
     from ccm.config import Env, Registry, load_state
     env = Env.from_environ()
     return env, Registry.load(env), load_state(env)
+
+
+@contextmanager
+def _mutating_ctx():
+    """变更注册表的命令:全程持 ~/.ccm/lock 并在锁内重新 load。
+
+    否则「锁外 load → 改 → 锁内 save」会丢更新:并发的两个 ccm 各拿旧快照,
+    后写的把先写的抹掉(§12)。
+    """
+    from ccm.config import Env, Registry, load_state, registry_lock
+    env = Env.from_environ()
+    with registry_lock(env):
+        yield env, Registry.load(env), load_state(env)
+
+
+def _parse_days(text, flag):
+    """'7d' / '7' → 7;其余给出人话错误而不是 ValueError traceback。"""
+    t = (text or "").strip().lower().rstrip("d")
+    if not t.isdigit() or int(t) <= 0:
+        raise CcmError(f"{flag} 需要形如 7d 的正整数天数,收到: {text!r}")
+    return int(t)
 
 
 def _resolve(env, registry, selector):
@@ -109,7 +131,6 @@ def cmd_doctor(args):
 
 
 def cmd_migrate(args):
-    import json as _json
     from ccm.migrate import build_plan, execute_migration, rollback_ops, Journal, cleanup
     env, _, _ = _env_ctx()
     if args.rollback:
@@ -161,7 +182,7 @@ def cmd_usage(args):
         from ccm.cost import CostDB
         from ccm.daemon import history as _history
         from ccm.render import table as _t
-        days = int(args.history.rstrip("d"))
+        days = _parse_days(args.history, "--history")
         h = _history(CostDB(env), days=days)
         print(_t(["日期", "账号", "5h峰值", "7d峰值"],
                  [[d, e or "-", f"{a}%", f"{b}%"] for d, e, a, b in h]))
@@ -240,9 +261,10 @@ def cmd_ls(args):
 
 def cmd_add(args):
     from ccm.lifecycle import add_profile
-    env, registry, _ = _env_ctx()
-    prof = add_profile(env, registry, args.name, note=args.note or "",
-                       import_dir=getattr(args, "import_dir", None), move=args.move)
+    with _mutating_ctx() as (env, registry, _):
+        prof = add_profile(env, registry, args.name, note=args.note or "",
+                           import_dir=getattr(args, "import_dir", None),
+                           move=args.move)
     # args.name 为空时自动分配了编码 id
     print(f"已注册 {prof.name}: {prof.path}"
           + (f" (email={prof.email})" if prof.email else ",未登录 — 跑 ccm login "
@@ -263,9 +285,10 @@ def cmd_rm(args):
         if input(f"删除 {args.name} ({prof.path})? [y/N] ").strip().lower() != "y":
             print("已取消")
             return 1
-    scan = scan_claude_procs(env.proc_root, env.user_home)
-    bak = remove_profile(env, registry, args.name, scan=scan,
-                         keep_data=args.keep_data)
+    with _mutating_ctx() as (env, registry, _):
+        scan = scan_claude_procs(env.proc_root, env.user_home)
+        bak = remove_profile(env, registry, args.name, scan=scan,
+                             keep_data=args.keep_data)
     print(f"已移除 {args.name}" + (f",备份: {bak}" if bak else "(数据保留)"))
     return 0
 
@@ -273,10 +296,10 @@ def cmd_rm(args):
 def cmd_rename(args):
     from ccm.lifecycle import rename_profile
     from ccm.procs import scan_claude_procs
-    env, registry, _ = _env_ctx()
-    scan = scan_claude_procs(env.proc_root, env.user_home)
-    old = _resolve(env, registry, args.old).name
-    rename_profile(env, registry, old, args.new, scan=scan)
+    with _mutating_ctx() as (env, registry, _):
+        scan = scan_claude_procs(env.proc_root, env.user_home)
+        old = _resolve(env, registry, args.old).name
+        rename_profile(env, registry, old, args.new, scan=scan)
     args.old = old
     print(f"{args.old} -> {args.new}")
     return 0
@@ -294,8 +317,10 @@ def cmd_logout(args):
         if input(f"登出 {args.name}(删除凭证,不留副本)? [y/N] ").strip().lower() != "y":
             print("已取消")
             return 1
-    scan = scan_claude_procs(env.proc_root, env.user_home)
-    logout_profile(env, registry, args.name, scan=scan, keep_backup=args.keep_backup)
+    with _mutating_ctx() as (env, registry, _):
+        scan = scan_claude_procs(env.proc_root, env.user_home)
+        logout_profile(env, registry, args.name, scan=scan,
+                       keep_backup=args.keep_backup)
     print(f"{args.name} 已登出" + ("(凭证已备份)" if args.keep_backup else "(未留副本)"))
     return 0
 
@@ -341,25 +366,29 @@ def cmd_shell(args):
 
 def cmd_shared(args):
     from ccm.sharing import shared_add, shared_rm
-    env, registry, _ = _env_ctx()
     if args.action == "ls":
+        env, registry, _ = _env_ctx()
         for item in registry.shared:
             src = registry.shared_root / item
             print(f"{'✓' if os.path.lexists(src) else '✗'} {item}")
-    elif args.action == "add":
-        shared_add(env, registry, args.item, from_profile=args.from_profile)
-        print(f"已加入共享并为全部 profile 铺链: {args.item}")
-    elif args.action == "rm":
-        shared_rm(env, registry, args.item)
-        print(f"已从清单移除(文件保留): {args.item}")
+        return 0
+    if not args.item:
+        raise CcmError(f"用法: ccm shared {args.action} <条目>")
+    with _mutating_ctx() as (env, registry, _):
+        if args.action == "add":
+            shared_add(env, registry, args.item, from_profile=args.from_profile)
+            print(f"已加入共享并为全部 profile 铺链: {args.item}")
+        elif args.action == "rm":
+            shared_rm(env, registry, args.item)
+            print(f"已从清单移除(文件保留): {args.item}")
     return 0
 
 
 def cmd_unlink(args):
     from ccm.sharing import unlink_item
-    env, registry, _ = _env_ctx()
-    args.name = _resolve(env, registry, args.name).name
-    unlink_item(env, registry, args.name, args.item)
+    with _mutating_ctx() as (env, registry, _):
+        args.name = _resolve(env, registry, args.name).name
+        unlink_item(env, registry, args.name, args.item)
     print(f"{args.name}/{args.item} 已独立(不再随共享变化)")
     return 0
 
@@ -497,7 +526,7 @@ def cmd_statusline(args):
     if not prof:
         print(name)
         return 0
-    uuid, _email = _fresh_identity(prof, env)
+    uuid, _email = _fresh_identity(prof, env, registry.default_profile)
     row = None
     if uuid:
         s = latest_sample(CostDB(env), uuid, max_age_s=900)
@@ -557,8 +586,8 @@ def cmd_backup(args):
 
 def cmd_restore(args):
     from ccm.backup import restore_backup
-    env, registry, _ = _env_ctx()
-    prof = restore_backup(env, registry, args.archive, into=args.into)
+    with _mutating_ctx() as (env, registry, _):
+        prof = restore_backup(env, registry, args.archive, into=args.into)
     print(f"已恢复为 {prof.name}: {prof.path}")
     return 0
 
@@ -574,8 +603,8 @@ def cmd_export(args):
 
 def cmd_import(args):
     from ccm.backup import restore_backup
-    env, registry, _ = _env_ctx()
-    prof = restore_backup(env, registry, args.file, into=args.into)
+    with _mutating_ctx() as (env, registry, _):
+        prof = restore_backup(env, registry, args.file, into=args.into)
     print(f"已导入为 {prof.name}: {prof.path}")
     return 0
 
@@ -588,11 +617,21 @@ def cmd_refresh(args):
         ([_resolve(env, registry, args.name).name] if args.name else None)
     if not names:
         raise CcmError("用法: ccm refresh <id|email> 或 ccm refresh --all")
+    if args.force and not args.yes:
+        msg = "--force 会越过活跃进程保护:若此刻有 claude 在跑,刷新会作废它手里的 " \
+              "refresh token,导致该账号掉线。"
+        if not sys.stdin.isatty():
+            raise CcmError(msg + "非交互环境请同时给 -y 明确授权")
+        if input(msg + "继续? [y/N] ").strip().lower() != "y":
+            print("已取消")
+            return 1
     scan = scan_claude_procs(env.proc_root, env.user_home)
     worst = 0
     for name in names:
         prof = registry.get(name)
-        r = refresh_profile(env, prof, scan=scan, force=args.force)
+        # 同源凭证的兄弟 profile 一并同步,否则轮换后它们手里那份就作废了
+        sibs = [q for n, q in registry.profiles.items() if n != name]
+        r = refresh_profile(env, prof, scan=scan, force=args.force, siblings=sibs)
         icon = {"refreshed": "✓", "skipped-valid": "✓", "skipped-active": "△",
                 "abandoned-cas": "△", "failed": "✗"}[r["status"]]
         print(f"{icon} {name}: {r['status']} — {r['detail']}")
@@ -610,7 +649,7 @@ def cmd_cost(args):
     scan_projects(env, registry, db)
     since = None
     if args.since:
-        n = int(args.since.rstrip("d"))
+        n = _parse_days(args.since, "--since")
         since = (datetime.now(timezone.utc) - timedelta(days=n)).strftime("%Y-%m-%d")
     rows = aggregate(db, by=args.by, since_ts=since)
     if args.json:
@@ -821,6 +860,8 @@ def build_parser():
     sp.add_argument("-a", "--all", action="store_true")
     sp.add_argument("-f", "--force", action="store_true",
                     help="越过活跃进程保护(CAS 仍生效)")
+    sp.add_argument("-y", "--yes", action="store_true",
+                    help="配合 --force: 免交互确认")
     sp.set_defaults(func=cmd_refresh)
 
     sp = sub.add_parser("cost", help="本地 token 统计与等价金额(非账单)")
@@ -854,5 +895,11 @@ def main(argv=None):
         env, registry, state = _env_ctx()
         print_grouped_help(env, registry, state)
         return 0
-    rc, _ = _dispatch_guard(lambda: args.func(args))
+    try:
+        rc, _ = _dispatch_guard(lambda: args.func(args))
+    except KeyboardInterrupt:
+        print("\nccm: 已中断", file=_sys.stderr)
+        return 130
+    except BrokenPipeError:
+        return 0
     return rc

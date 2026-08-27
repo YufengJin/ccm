@@ -69,11 +69,17 @@ def run_checks(env, registry, state, fix=False, opener=None, online=False):
         conflicts = [a for a in plan if a.status == "conflict"]
         fixed = False
         if broken and fix:
-            apply_links(prof.path, registry.shared_root, registry.shared)
-            fixed = True
+            # 修完必须复核:apply_links 也可能因权限等原因没修成,
+            # 直接报 ok 会把没修好的问题盖过去。
+            after = apply_links(prof.path, registry.shared_root, registry.shared)
+            still = [a for a in after if a.status in ("missing", "wrong")]
+            fixed = not still
+            if still:
+                broken = still
         if broken:
             out.append(CheckResult("shared-links", name, "ok" if fixed else "fail",
-                                   f"{len(broken)} 条链接待修: "
+                                   (f"{len(broken)} 条链接已重建: " if fixed else
+                                    f"{len(broken)} 条链接待修: ")
                                    + ", ".join(a.item for a in broken), fixed))
         if conflicts:
             # 实体冲突绝不自动修(可能含用户新内容,spec §15.7)
@@ -106,20 +112,23 @@ def run_checks(env, registry, state, fix=False, opener=None, online=False):
         if not os.path.lexists(src):
             out.append(CheckResult("shared-source", item, "warn",
                                    f"清单中的共享项不存在: {src}(跳过铺链)"))
-    # state 指向有效性
-    if state:
-        active = state.get("active")
+    # state 指向有效性。注意:state.json **完全缺失**时也必须报 —— 以前 `if state:`
+    # 直接跳过,迁移阶段 6 的门禁因此看不见「没有活跃 profile」(codex 审核发现)。
+    if registry.profiles:
+        active = (state or {}).get("active")
         if active not in registry.profiles:
             fallback = registry.default_profile \
                 if registry.default_profile in registry.profiles else \
-                (sorted(registry.profiles)[0] if registry.profiles else None)
-            if fix and fallback:
+                sorted(registry.profiles)[0]
+            if fix:
                 save_state(env, fallback, "doctor --fix")
-                out.append(CheckResult("state", active or "?", "ok",
+                out.append(CheckResult("state", active or "-", "ok",
                                        f"已回落到 {fallback}", True))
             else:
-                out.append(CheckResult("state", active or "?", "fail",
-                                       f"state 指向不存在的 profile: {active}"))
+                out.append(CheckResult(
+                    "state", active or "-", "fail",
+                    f"state 指向不存在的 profile: {active}" if active
+                    else "state 缺失,没有活跃 profile"))
         else:
             out.append(CheckResult("state", active, "ok", "有效"))
     # 遗留文件提示

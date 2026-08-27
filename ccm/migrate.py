@@ -2,28 +2,79 @@
 
 journal 两段式(intent → done),SIGKILL/断电后按文件系统实际状态续跑或回滚。
 """
+import ctypes
+import ctypes.util
+import errno
 import os
 from pathlib import Path
 
-from ccm.config import atomic_write_json, load_json
+from ccm.config import atomic_write_json, fsync_dir, load_json
 from ccm.errors import MigrationAborted
 
 _STAGING_SUFFIX = ".ccm-staging"
+_AT_FDCWD = -100
+_RENAME_NOREPLACE = 1
+_renameat2 = None
+
+
+def _get_renameat2():
+    """glibc renameat2;拿不到就返回 None(退回尽力而为的 lstat+rename)。"""
+    global _renameat2
+    if _renameat2 is None:
+        try:
+            libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6",
+                               use_errno=True)
+            fn = libc.renameat2
+            fn.argtypes = [ctypes.c_int, ctypes.c_char_p,
+                           ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+            fn.restype = ctypes.c_int
+            _renameat2 = fn
+        except (OSError, AttributeError):
+            _renameat2 = False
+    return _renameat2 or None
+
+
+def rename_noreplace(src, dst):
+    """rename,但目标已存在就失败而不是静默覆盖。
+
+    普通 os.rename 会覆盖同类型目标,「先检查后 rename」的事后类型复核发现不了
+    竞态创建的抢占者(codex 审核发现)。内核/文件系统不支持 RENAME_NOREPLACE 时
+    退回尽力而为版本 —— 窗口仍在,但迁移的前置条件本来就是无并发写者。
+    """
+    src, dst = str(src), str(dst)
+    fn = _get_renameat2()
+    if fn is not None:
+        ctypes.set_errno(0)
+        if fn(_AT_FDCWD, os.fsencode(src), _AT_FDCWD, os.fsencode(dst),
+              _RENAME_NOREPLACE) == 0:
+            return
+        err = ctypes.get_errno()
+        if err == errno.EEXIST:
+            raise MigrationAborted(f"目标在操作期间被抢占创建,已中止: {dst}")
+        if err not in (errno.ENOSYS, errno.EINVAL, errno.ENOTTY):
+            raise OSError(err, os.strerror(err), src, None, dst)
+    if os.path.lexists(dst):
+        raise MigrationAborted(f"目标在操作期间被抢占创建,已中止: {dst}")
+    os.rename(src, dst)
+
+
+MIGRATE_JOURNAL = "migrate-journal.json"
+OP_JOURNAL = "op-journal.json"       # add --move / shared add 等单步操作专用
 
 
 class Journal:
-    def __init__(self, env, ops=None):
+    def __init__(self, env, ops=None, name=MIGRATE_JOURNAL):
         self._env = env
         self.ops = ops or []
+        self.name = name
 
     @property
     def path(self):
-        return self._env.ccm_home / "logs" / "migrate-journal.json"
+        return self._env.ccm_home / "logs" / self.name
 
     @classmethod
-    def load(cls, env):
-        return cls(env, load_json(env.ccm_home / "logs" / "migrate-journal.json",
-                                  default=[]))
+    def load(cls, env, name=MIGRATE_JOURNAL):
+        return cls(env, load_json(env.ccm_home / "logs" / name, default=[]), name=name)
 
     def _flush(self):
         atomic_write_json(self.path, self.ops, mode=0o600)
@@ -43,6 +94,13 @@ class Journal:
             os.unlink(self.path)
         except FileNotFoundError:
             pass
+
+
+def assert_no_pending_migration(env):
+    """单步操作前的门禁:migrate journal 未完结时任何搬迁都可能踩坏回滚基线。"""
+    if Journal.load(env).ops:
+        raise MigrationAborted(
+            "存在未完结的迁移 journal,拒绝执行搬迁类操作;先 ccm migrate --rollback")
 
 
 def _lstat_kind(p):
@@ -76,22 +134,28 @@ def _staged_swap(old, new, journal, op_name):
         raise MigrationAborted(f"staging 位置被占用且不是 symlink: {staging}")
     idx = journal.intent({"op": op_name, "old": str(old), "new": str(new)})
     os.symlink(new, staging)  # 此刻 dangling,合法
+    fsync_dir(staging.parent)
     try:
-        os.rename(old, new)
-    except OSError:
+        rename_noreplace(old, new)
+    except BaseException:
         os.unlink(staging)
         raise
+    fsync_dir(new.parent)
     if _lstat_kind(new) not in ("dir", "file"):
         raise MigrationAborted(f"rename 后 {new} 类型异常: {_lstat_kind(new)}")
     try:
-        os.rename(staging, old)
-    except OSError:
-        os.rename(new, old)  # 回退
+        rename_noreplace(staging, old)
+    except BaseException:
+        try:
+            rename_noreplace(new, old)   # 回退;失败也不掩盖原异常,journal 能续跑
+        except BaseException:
+            pass
         try:
             os.unlink(staging)
         except OSError:
             pass
         raise
+    fsync_dir(old.parent)
     if _lstat_kind(old) != "symlink":
         raise MigrationAborted(f"rename 后 {old} 不是 symlink: {_lstat_kind(old)}")
     journal.done(idx)
@@ -103,11 +167,20 @@ def move_dir_with_compat(old, new, journal):
 
 def split_item(src_dir, item, shared_root, journal):
     src = Path(src_dir) / item
+    want = Path(shared_root) / item
     if src.is_symlink():
-        return  # 已拆分或本来就是链接,幂等
+        # 只有**精确指向**预期共享项才算已拆分。以前任何 symlink 都当已完成,
+        # 于是「迁移前 settings.json 已链到 dotfiles」会让 shared_root 里根本
+        # 不生成源,所有 profile 都 skip 铺链,迁移却报成功(codex 审核发现)。
+        actual = os.readlink(src)
+        if actual == str(want):
+            return
+        raise MigrationAborted(
+            f"{src} 已是 symlink 且指向 {actual}(预期 {want});"
+            f"请先把它换成实体文件、或手工把目标移入 {shared_root} 后重试")
     if not os.path.lexists(src):
         return  # 该共享项在源中不存在,跳过
-    _staged_swap(src, Path(shared_root) / item, journal, "split_item")
+    _staged_swap(src, want, journal, "split_item")
 
 
 def _undo_one(op):
@@ -119,9 +192,9 @@ def _undo_one(op):
         pass  # 该步未开始(或已被逆转)
     elif k_old == "symlink" and os.readlink(old) == str(new) and k_new in ("dir", "file"):
         os.unlink(old)          # 完整完成态:摘链 + 搬回
-        os.rename(new, old)
+        rename_noreplace(new, old)
     elif k_old == "absent" and k_new in ("dir", "file"):
-        os.rename(new, old)     # 两次 rename 之间崩溃
+        rename_noreplace(new, old)   # 两次 rename 之间崩溃
     else:
         raise MigrationAborted(
             f"回滚校验失败: {old}({k_old}) / {new}({k_new}) 状态非预期,疑被外部修改;"
@@ -130,17 +203,37 @@ def _undo_one(op):
         os.unlink(staging)
 
 
+def _undo_relink(op):
+    """按 new/prev/absent 严格判定,绝不删除不是本操作写入的链接。
+
+    以前无条件 unlink:intent 落盘后崩溃、别的进程在该路径建了链接,
+    --rollback 会把它删掉(codex 审核发现)。
+    """
+    dst = Path(op["path"])
+    prev, new = op.get("prev"), op.get("new")
+    kind = _lstat_kind(dst)
+    if kind == "symlink":
+        actual = os.readlink(dst)
+        if actual == prev:
+            return                      # 已是回滚后的样子,幂等
+        if new is not None and actual != new:
+            raise MigrationAborted(
+                f"回滚校验失败: {dst} 指向 {actual},既不是本次写入的 {new} "
+                f"也不是原值 {prev};疑被外部修改,请人工检查")
+        os.unlink(dst)
+    elif kind != "absent":
+        raise MigrationAborted(f"回滚校验失败: {dst} 是 {kind},预期 symlink 或不存在")
+    if prev:
+        os.symlink(prev, dst)
+
+
 def rollback_ops(env, journal):
     """逆序回滚 journal 里的全部 op;完成后删 journal。"""
     for op in reversed(journal.ops):
         if op["op"] in ("move_dir", "split_item"):
             _undo_one(op)
         elif op["op"] == "relink":
-            dst = Path(op["path"])
-            if dst.is_symlink():
-                os.unlink(dst)
-            if op.get("prev"):
-                os.symlink(op["prev"], dst)
+            _undo_relink(op)
         elif op["op"] == "mkdir":
             try:
                 os.rmdir(op["path"])
@@ -169,6 +262,9 @@ def build_plan(env):
     for root in (env.accounts_root, env.shared_root):
         if os.path.lexists(root) and (not root.is_dir() or any(root.iterdir())):
             raise MigrationAborted(f"目标已存在且非空: {root}")
+    # 预检:迁移要占用的 id 不能已经被注册表里的别的 profile 用掉
+    from ccm.config import Registry
+    existing = Registry.load(env).profiles
     moves = []
     for name, base in PROFILE_MAP:
         old = home / base
@@ -176,6 +272,10 @@ def build_plan(env):
             new = env.accounts_root / name
             if os.path.lexists(new):
                 raise MigrationAborted(f"目标已存在: {new}")
+            if name in existing:
+                raise MigrationAborted(
+                    f"注册表里已有 profile {name}({existing[name].path}),"
+                    f"与迁移要创建的同名;先 ccm rename {name} <新名> 再迁移")
             moves.append({"profile": name, "old": str(old), "new": str(new)})
     splits = [item for item in DEFAULT_SHARED
               if os.path.lexists(home / ".claude" / item)]
@@ -217,14 +317,21 @@ def _backup(env, plan):
     return dest
 
 
-def _doctor_gate(env):
+def _doctor_gate(env, plan=None):
     """阶段 6:只把迁移不变量类 fail 当回滚信号(codex 审核采纳)。"""
     from ccm.config import Registry, load_state
     from ccm.doctor import INVARIANT_CHECKS, run_checks
     registry = Registry.load(env)
     results = run_checks(env, registry, load_state(env), fix=False)
-    return [f"{r.check}[{r.subject}]: {r.msg}" for r in results
-            if r.level == "fail" and r.check in INVARIANT_CHECKS]
+    problems = [f"{r.check}[{r.subject}]: {r.msg}" for r in results
+                if r.level == "fail" and r.check in INVARIANT_CHECKS]
+    # doctor 的 shared-source 只会是 warn(清单里的可选项本来就允许不存在),
+    # 所以那条不变量在门禁里其实是死的。这里改为按**本次计划**校验:计划里说要
+    # 拆出去的源必须真的落在 shared_root(codex 审核发现)。
+    for item in (plan or {}).get("splits", []):
+        if not os.path.lexists(env.shared_root / item):
+            problems.append(f"shared-source[{item}]: 计划要求拆出的共享源未生成")
+    return problems
 
 
 def execute_migration(env, plan, backup=True):
@@ -235,14 +342,19 @@ def execute_migration(env, plan, backup=True):
     journal = Journal.load(env)
     if journal.ops:
         raise MigrationAborted("存在未完结的迁移 journal;先 ccm migrate --rollback")
+    # 失败时要还原到迁移前的注册表快照,而不是把用户既有的删掉
+    prev_reg = load_json(env.ccm_home / "profiles.json")
+    prev_state = load_json(env.ccm_home / "state.json")
     if backup:
         _backup(env, plan)
     # 记录本次创建的 root(rollback 时移除)
     for root in (env.accounts_root, env.shared_root):
         if not os.path.lexists(root):
+            # write-ahead:先记 intent 再建,否则两句之间被 SIGKILL 会留下
+            # 没人认领的 root,--rollback 说无事可回滚(codex 审核发现)
+            idx = journal.intent({"op": "mkdir", "path": str(root)})
             root.mkdir(parents=True)
-            journal.intent({"op": "mkdir", "path": str(root)})
-            journal.done(len(journal.ops) - 1)
+            journal.done(idx)
     try:
         # 阶段 2:搬 profile(旧路径留兼容 symlink)
         for m in plan["moves"]:
@@ -252,7 +364,8 @@ def execute_migration(env, plan, backup=True):
         for item in plan["splits"]:
             split_item(default_dir, item, env.shared_root, journal)
         # 阶段 4:全部 profile 铺共享链接
-        registry = Registry.empty(env)
+        # 用既有注册表而非 Registry.empty():已经 ccm add 过的 profile 不能被抹掉
+        registry = Registry.load(env)
         for m in plan["moves"]:
             name = m["profile"]
             path = env.accounts_root / name
@@ -264,22 +377,32 @@ def execute_migration(env, plan, backup=True):
                 account_uuid=ident.get("account_uuid"), email=ident.get("email"),
                 subscription=ident.get("subscription"),
                 rate_limit_tier=ident.get("rate_limit_tier"))
+        # §10 阶段 4 要求「为**全部** profile 生成共享链接」:迁移前就注册过的
+        # profile 当时 shared_root 还是空的(skip_no_source),现在才补得上。
+        moved = {m["profile"] for m in plan["moves"]}
+        for name, prof in registry.profiles.items():
+            if name not in moved and prof.path.is_dir():
+                journaled_apply_links(prof.path, env.shared_root,
+                                      registry.shared, journal)
         # 阶段 5:落注册表与 state
         registry.default_profile = DEFAULT_ID
         registry.save(env)
         save_state(env, DEFAULT_ID, "ccm migrate")
         # 阶段 6:doctor 门禁
-        problems = _doctor_gate(env)
+        problems = _doctor_gate(env, plan)
         if problems:
             raise MigrationAborted("doctor 不变量检查失败: " + "; ".join(problems))
     except BaseException:
         rollback_ops(env, Journal.load(env))
-        # 迁移中途写的注册表/State 一并清掉,回到未迁移状态
-        for f in ("profiles.json", "state.json"):
-            try:
-                os.unlink(env.ccm_home / f)
-            except FileNotFoundError:
-                pass
+        # 还原迁移前的注册表快照:之前是什么就写回什么,没有才删除
+        for fname, snap in (("profiles.json", prev_reg), ("state.json", prev_state)):
+            if snap is None:
+                try:
+                    os.unlink(env.ccm_home / fname)
+                except FileNotFoundError:
+                    pass
+            else:
+                atomic_write_json(env.ccm_home / fname, snap)
         raise
     journal.clear()
 

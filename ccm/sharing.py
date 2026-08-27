@@ -7,7 +7,8 @@ from pathlib import Path
 from ccm.config import validate_shared_item
 from ccm.errors import CcmError
 from ccm.layout import apply_links
-from ccm.migrate import Journal, split_item
+from ccm.migrate import (OP_JOURNAL, Journal, assert_no_pending_migration,
+                         split_item)
 
 
 def shared_add(env, registry, item, from_profile=None):
@@ -22,7 +23,8 @@ def shared_add(env, registry, item, from_profile=None):
         prof = registry.get(from_profile)
         if not os.path.lexists(prof.path / item):
             raise CcmError(f"{prof.path / item} 不存在,无从收编")
-        j = Journal.load(env)
+        assert_no_pending_migration(env)   # 绝不与未完结的 migrate 抢 journal
+        j = Journal.load(env, OP_JOURNAL)  # 独立 journal,不碰 migrate 的
         split_item(prof.path, item, registry.shared_root, j)
         j.clear()
     registry.shared.append(item)

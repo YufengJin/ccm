@@ -6,6 +6,10 @@ from pathlib import Path
 
 from ccm.config import Env
 
+# 测试跑在 tmpfs/临时目录上,不需要断电级持久化;开着 fsync 会让每个迁移类测试
+# 多花近 1 秒。生产默认仍是开启的(见 test_regressions 里的断言)。
+os.environ.setdefault("CCM_FSYNC", "0")
+
 ACCT_A = "acct-A"  # jyf* 账号(default 与 personal 共享)
 ACCT_B = "acct-B"  # 公司账号(work)
 

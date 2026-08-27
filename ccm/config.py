@@ -54,6 +54,8 @@ class Env:
 
 def expand(s, home):
     """'~/x' → home/x;不用 os.path.expanduser(它读真实 HOME,破坏测试隔离)。"""
+    if not isinstance(s, str):
+        raise CcmError(f"路径字段应为字符串,实际 {type(s).__name__}: {s!r}")
     if s == "~":
         return Path(home)
     if s.startswith("~/"):
@@ -74,16 +76,52 @@ def _ensure_ccm_home(env):
     env.ccm_home.mkdir(parents=True, exist_ok=True, mode=0o700)
 
 
-def atomic_write_json(path, obj, mode=0o644):
+def fsync_enabled():
+    """CCM_FSYNC=0 关闭刷盘。默认开;测试套件关掉它以免每次迁移多花近 1 秒。
+
+    关掉只影响**断电**下的可恢复性;SIGKILL/崩溃场景靠页缓存,不受影响。
+    """
+    return os.environ.get("CCM_FSYNC", "1") != "0"
+
+
+def fsync_dir(path):
+    """把目录项本身刷盘 —— 只 fsync 文件不保证 rename/创建对断电可见。"""
+    if not fsync_enabled():
+        return
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def atomic_write_json(path, obj, mode=0o644, durable=True):
+    """写 tmp → fsync → replace → fsync 父目录。
+
+    durable 是默认值:migrate journal 的「断电后可续跑/回滚」承诺(§10)只有在
+    intent 真的先于文件系统操作落盘时才成立;不 fsync 的话页缓存里的 journal
+    可能比已落盘的 rename 更旧(codex 审核发现)。
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True,
                       mode=0o700 if ".ccm" in path.parts or path.parent.name == ".ccm" else 0o755)
+    durable = durable and fsync_enabled()
     tmp = path.with_name(path.name + f".tmp{os.getpid()}")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
     try:
         with os.fdopen(fd, "w") as f:
             json.dump(obj, f, ensure_ascii=False, indent=2)
+            if durable:
+                f.flush()
+                os.fsync(f.fileno())
         os.replace(tmp, path)
+        if durable:
+            fsync_dir(path.parent)
     except BaseException:
         try:
             os.unlink(tmp)
@@ -103,17 +141,70 @@ def load_json(path, default=None):
         raise CcmError(f"JSON 损坏: {path} ({e})")
 
 
+_LOCK_DEPTH = 0
+
+
 @contextmanager
 def registry_lock(env):
+    """~/.ccm/lock 的排他 flock。
+
+    **必须可重入**:flock 按 open file description 计,同进程用两个 fd 再取
+    LOCK_EX 会自锁死。registry_transaction 里还会调 Registry.save(),后者自己
+    也取锁 —— 用进程内深度计数放行嵌套。
+    """
+    global _LOCK_DEPTH
     _ensure_ccm_home(env)
-    lock_path = env.ccm_home / "lock"
-    fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT, 0o600)
+    if _LOCK_DEPTH:
+        _LOCK_DEPTH += 1
+        try:
+            yield
+        finally:
+            _LOCK_DEPTH -= 1
+        return
+    fd = os.open(env.ccm_home / "lock", os.O_WRONLY | os.O_CREAT, 0o600)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
-        yield
+        _LOCK_DEPTH += 1
+        try:
+            yield
+        finally:
+            _LOCK_DEPTH -= 1
+            fcntl.flock(fd, fcntl.LOCK_UN)
     finally:
-        fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
+
+
+@contextmanager
+def registry_transaction(env):
+    """变更类命令的读-改-写事务:全程持锁,锁内重新 load,正常退出时 save。
+
+    没有它的话「load(锁外) → 改 → save(锁内)」会丢更新:两个 ccm 并发 add,
+    后写的那个用自己的旧快照覆盖掉先写的结果(§12)。
+    """
+    with registry_lock(env):
+        registry = Registry.load(env)
+        yield registry
+        registry.save(env)
+
+
+def _is_within(child, parent):
+    """child 是否等于 parent 或位于其下。"""
+    try:
+        Path(child).resolve().relative_to(Path(parent).resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def validate_roots(shared_root, accounts_root, profiles):
+    """§6:shared_root / accounts_root 不得互为祖先,也不得与任一 profile 路径嵌套。"""
+    if _is_within(shared_root, accounts_root) or _is_within(accounts_root, shared_root):
+        raise CcmError(f"shared_root 与 accounts_root 不得嵌套: "
+                       f"{shared_root} / {accounts_root}")
+    for name, prof in profiles.items():
+        if _is_within(prof.path, shared_root) or _is_within(shared_root, prof.path):
+            raise CcmError(f"profile {name!r} 的路径与 shared_root 嵌套: "
+                           f"{prof.path} / {shared_root}")
 
 
 class Registry:
@@ -141,8 +232,11 @@ class Registry:
         for item in shared:
             validate_shared_item(item)
         profiles = {}
-        for name, pd in raw.get("profiles", {}).items():
+        for name, pd in (raw.get("profiles") or {}).items():
             validate_profile_name(name)
+            if not isinstance(pd, dict) or not isinstance(pd.get("path"), str):
+                raise CcmError(f"profiles.json 中 {name!r} 缺少合法的 path 字段: "
+                               f"{env.ccm_home / 'profiles.json'}")
             profiles[name] = Profile(
                 name=name,
                 path=expand(pd["path"], home),
@@ -158,10 +252,11 @@ class Registry:
         if default is None:   # 旧注册表升级:魔法名 "default" 时代
             default = "default" if "default" in profiles else \
                 ("a1" if "a1" in profiles else None)
-        return cls(env,
-                   expand(raw.get("shared_root", contract(env.shared_root, home)), home),
-                   expand(raw.get("accounts_root", contract(env.accounts_root, home)), home),
-                   shared, profiles, default_profile=default)
+        shared_root = expand(raw.get("shared_root") or contract(env.shared_root, home), home)
+        accounts_root = expand(raw.get("accounts_root") or contract(env.accounts_root, home), home)
+        validate_roots(shared_root, accounts_root, profiles)
+        return cls(env, shared_root, accounts_root, shared, profiles,
+                   default_profile=default)
 
     def save(self, env=None):
         env = env or self._env
