@@ -552,6 +552,68 @@ class TestDurability(Base):
         self.assertGreaterEqual(len(calls), 2, "文件与父目录都要 fsync")
 
 
+class TestStatuslineIsSessionScoped(Base):
+    """statusline 报的必须是**本会话**的账号,不是全局 state。"""
+
+    def _run(self, *argv, config_dir=None):
+        import io as _io
+        from contextlib import redirect_stdout
+        from ccm.cli import main
+        saved = {k: os.environ.get(k)
+                 for k in ("CCM_USER_HOME", "CLAUDE_CONFIG_DIR")}
+        os.environ["CCM_USER_HOME"] = str(self.tmp)
+        if config_dir is None:
+            os.environ.pop("CLAUDE_CONFIG_DIR", None)
+        else:
+            os.environ["CLAUDE_CONFIG_DIR"] = str(config_dir)
+        out = _io.StringIO()
+        try:
+            with redirect_stdout(out):
+                main(list(argv))
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        return out.getvalue().strip()
+
+    def setUp(self):
+        super().setUp()
+        execute_migration(self.env, build_plan(self.env), backup=False)
+        from ccm.config import save_state
+        save_state(self.env, "a3", "test")     # 全局默认切到 a3
+
+    def test_env_wins_over_state(self):
+        """在别的终端切过号之后,本会话的 statusline 不该跟着变。"""
+        line = self._run("statusline",
+                         config_dir=self.env.accounts_root / "a1")
+        self.assertTrue(line.startswith("a1 "), line)
+
+    def test_compat_link_resolves_to_same_profile(self):
+        """老进程用的是 ~/.claude-a 这种兼容链接,也要认得出来。"""
+        line = self._run("statusline", config_dir=self.tmp / ".claude-a")
+        self.assertTrue(line.startswith("a2 "), line)
+
+    def test_falls_back_to_state_without_env(self):
+        self.assertTrue(self._run("statusline").startswith("a3 "))
+
+    def test_unregistered_dir_falls_back_to_state(self):
+        stray = self.tmp / "somewhere-else"
+        stray.mkdir()
+        self.assertTrue(self._run("statusline", config_dir=stray)
+                        .startswith("a3 "))
+
+    def test_profile_for_path_helper(self):
+        from ccm.selector import profile_for_path
+        reg = Registry.load(self.env)
+        self.assertEqual(
+            profile_for_path(reg, self.env.accounts_root / "a1").name, "a1")
+        self.assertEqual(profile_for_path(reg, self.tmp / ".claude-b").name, "a3")
+        self.assertIsNone(profile_for_path(reg, None))
+        self.assertIsNone(profile_for_path(reg, self.tmp / "nope"))
+
+
 class TestRcBlockHelp(unittest.TestCase):
     def test_help_is_not_evaluated_as_shell_code(self):
         """`ccm switch --help` 会带上 --emit-env,argparse 以 0 返回帮助文本。

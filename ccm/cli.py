@@ -188,10 +188,14 @@ def cmd_usage(args):
                  [[d, e or "-", f"{a}%", f"{b}%"] for d, e, a, b in h]))
         return 0
     def _active_uuid():
+        from ccm.selector import profile_for_path
         from ccm.usage import _fresh_identity
-        state = _env_ctx()[2]
-        name = (state or {}).get("active")
-        prof = registry.profiles.get(name) if name else None
+        # 同 statusline:优先看本 shell 的 CLAUDE_CONFIG_DIR(ccm shell/run 会把它
+        # 钉死),没有才回落到 state.json 这个全局默认
+        prof = profile_for_path(registry, os.environ.get("CLAUDE_CONFIG_DIR"))
+        if prof is None:
+            name = (_env_ctx()[2] or {}).get("active")
+            prof = registry.profiles.get(name) if name else None
         return _fresh_identity(prof, env, registry.default_profile)[0] if prof else None
     if args.watch:
         import time as _time
@@ -520,12 +524,19 @@ def cmd_statusline(args):
     from ccm.daemon import latest_sample
     from ccm.usage import AccountRow, statusline_text, _fresh_identity
     from ccm.config import load_json
+    from ccm.selector import profile_for_path
     env, registry, state = _env_ctx()
-    name = (state or {}).get("active") or registry.default_profile or "?"
-    prof = registry.profiles.get(name)
-    if not prof:
-        print(name)
-        return 0
+    # statusline 是在**会话内部**渲染的,CLAUDE_CONFIG_DIR 才是这个会话真正在用的
+    # 账号。state.json 是「新开的 shell 会用哪个」的全局默认 —— 在别的终端切过号
+    # 之后就跟本会话不符,statusline 会报出一个跟自己无关的账号。
+    prof = profile_for_path(registry, os.environ.get("CLAUDE_CONFIG_DIR"))
+    if prof is None:
+        name = (state or {}).get("active") or registry.default_profile or "?"
+        prof = registry.profiles.get(name)
+        if not prof:
+            print(name)
+            return 0
+    name = prof.name
     uuid, _email = _fresh_identity(prof, env, registry.default_profile)
     row = None
     if uuid:

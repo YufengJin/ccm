@@ -8,6 +8,7 @@
 命中多个且同属一个 account → 自动挑最优(token 有效 > 默认 profile > id 序);
 跨 account 的多命中 → 报歧义并列出候选,绝不猜。
 """
+import os
 import re
 
 from ccm.errors import CcmError, CredentialsMissing, ProfileNotFound
@@ -15,6 +16,30 @@ from ccm.identity import read_credentials, resolve_identity
 from ccm.oauth import token_state
 
 _AUTO_RE = re.compile(r"^a(\d+)$")
+
+
+def profile_for_path(registry, path):
+    """把一个配置目录路径(通常是 CLAUDE_CONFIG_DIR)映射回注册表里的 profile。
+
+    兼容链接也算数:~/.claude-b 与 accounts_root/a3 指的是同一个 profile。
+    认不出来返回 None(比如指向一个没注册过的目录)。
+    """
+    if not path:
+        return None
+    try:
+        target = os.path.realpath(path)
+    except OSError:
+        return None
+    for prof in registry.profiles.values():
+        for cand in (prof.path, prof.compat_link):
+            if cand is None:
+                continue
+            try:
+                if os.path.realpath(cand) == target:
+                    return prof
+            except OSError:
+                continue
+    return None
 
 
 def next_auto_id(registry):
