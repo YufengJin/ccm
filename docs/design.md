@@ -312,7 +312,7 @@ access token 寿命只有数小时。刷新会**轮换 refresh token**。而 Cla
 
 **P1 实现 refresh 时的附加约束**(codex 审核采纳):锁粒度按 **account**(refresh token 指纹)而非 profile——同 account 两个 profile 并发刷新会互相作废;`--all` 对同组凭证串行。写回前必须校验 `.credentials.json` 的 mtime/内容与读取时一致(CAS),变了说明 Claude Code 刚刷新过,放弃写入直接重读。进程扫描是瞬时观察,存在 TOCTOU;「无活跃进程」只是必要条件,CAS 校验才是最后防线;`/proc` 不可读等未知状态一律按「有活跃进程」处理。
 
-**活跃进程判定**：扫描 `/proc/*/environ` 取 `CLAUDE_CONFIG_DIR`，并把值与兼容链接一起 `realpath` 后比较；同时检查 `<profile>/daemon.lock` 里记录的 pid 是否存活。
+**活跃进程判定**：先按可执行文件筛出 Claude Code **本体**(`/proc/<pid>/exe` 或 argv 的路径分量含 `claude` / `claude-code`,见 §16.12),再扫描其 `environ` 取 `CLAUDE_CONFIG_DIR`，并把值与兼容链接一起 `realpath` 后比较；同时检查 `<profile>/daemon.lock` 里记录的 pid 是否存活。
 
 ### 本地 token 统计与成本折算
 
@@ -669,3 +669,25 @@ ENOENT。
 疑似 claude 进程)只提示不拦截:与 refresh 的保守策略相反,因为删链接是可逆的
 (`ccm doctor --fix` 一键重建),而永久拦截会让 cleanup 在有任何不可读进程的机器
 上永远跑不完。
+
+### 16.12 活跃进程只认 Claude Code 本体(§9 再修订)
+
+实机踩坑:token 过期后 `ccm usage` 一直「不可用」,`ccm refresh` 一直
+`skipped-active`,只有真开一次 claude 会话让它自己刷 token 才恢复。原因是
+§9 的判定只看 `environ` 里有没有 `CLAUDE_CONFIG_DIR` / `CLAUDECODE=1`,而
+Claude Code 派生的**所有子进程**都原样继承这两个变量:Bash 工具跑的 sleep
+循环、从会话里启动的 litellm / PM2 / node 服务、甚至 ccm 自己的 daemon。
+现场 a1 名下 17 个「活跃」pid 里只有 1 个是 claude。这些子进程既不持有也不
+刷新凭证,却把 refresh 永久挡住。
+
+修法:`scan_claude_procs` 先看可执行文件再看 environ。判定 Claude Code 本体
+的依据是 `/proc/<pid>/exe`、`argv[0]`,以及 node/bun 解释器后面的脚本
+`argv[1]`,按**路径分量**精确匹配 `claude` / `claude-code`(原生安装
+`~/.local/share/claude/versions/x.y.z`,npm 安装 `@anthropic-ai/claude-code/cli.js`);
+`exe` 带 ` (deleted)` 后缀(升级后旧进程)同样算。不做子串匹配,否则
+`claudecodeui` 之类第三方服务、cmdline 里带 `~/.claude` 路径的 bash 包装都会
+误判。§16.5 的 UNKNOWN 桶沿用同一判定:environ 不可读**且**可执行文件是
+claude 才入桶。
+
+仍然保留的行为:真正的 claude 会话(含 Claude Code 自己的 `claude daemon run`)
+在跑时,该 profile 的 refresh 依旧拒绝 —— 这是 §9 的核心约束,没有动。
